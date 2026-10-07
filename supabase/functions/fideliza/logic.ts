@@ -253,8 +253,14 @@ export async function twilioSignature(authToken: string, url: string, params: Re
 }
 
 export function waAddress(patient: any, s: any): string {
-  if (patient.wa_address) return patient.wa_address;
   const raw = (patient.phone || "").trim();
   if (raw.startsWith("+")) return "whatsapp:+" + raw.replace(/\D/g, "");
   return "whatsapp:" + (s.mx_prefix || "+521") + digits10(raw);
+}
+
+// Los celulares de México pueden estar dados de alta como +52 o como +521: se prueban ambos.
+export function mxVariants(to: string): string[] {
+  const m = to.match(/^whatsapp:\+52(1?)(\d{10})$/);
+  if (!m) return [to];
+  return [to, "whatsapp:+52" + (m[1] ? "" : "1") + m[2]];
 }

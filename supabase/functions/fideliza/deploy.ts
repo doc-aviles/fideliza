@@ -258,10 +258,16 @@ async function twilioSignature(authToken: string, url: string, params: Record<st
 }
 
 function waAddress(patient: any, s: any): string {
-  if (patient.wa_address) return patient.wa_address;
   const raw = (patient.phone || "").trim();
   if (raw.startsWith("+")) return "whatsapp:+" + raw.replace(/\D/g, "");
   return "whatsapp:" + (s.mx_prefix || "+521") + digits10(raw);
+}
+
+// Los celulares de México pueden estar dados de alta como +52 o como +521: se prueban ambos.
+function mxVariants(to: string): string[] {
+  const m = to.match(/^whatsapp:\+52(1?)(\d{10})$/);
+  if (!m) return [to];
+  return [to, "whatsapp:+52" + (m[1] ? "" : "1") + m[2]];
 }
 
 
@@ -292,18 +298,36 @@ const TW_ERRORS: Record<string, string> = {
 };
 const explain = (code: unknown, fallback: string) => TW_ERRORS[String(code)] ?? `${fallback || "Error de Twilio"}${code ? ` (código ${code})` : ""}`;
 
+const SANDBOX = "whatsapp:+14155238886";
+let lastRoute = "";
+
+async function twilioOnce(from: string, to: string, body: string) {
+  const form = new URLSearchParams({ From: from, To: to, Body: body, StatusCallback: `${BASE}/status` });
+  const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TW_SID}/Messages.json`, {
+    method: "POST",
+    headers: { Authorization: "Basic " + btoa(`${TW_SID}:${TW_TOKEN}`), "Content-Type": "application/x-www-form-urlencoded" },
+    body: form,
+  });
+  const j = await r.json().catch(() => ({}));
+  return r.ok ? { sid: j.sid as string } : { error: explain(j.code, j.message) };
+}
+
+// Prueba las combinaciones de remitente y formato de número hasta que Twilio acepte una.
 async function twilioSend(to: string, body: string): Promise<{ sid?: string; error?: string }> {
   if (!TW_SID || !TW_TOKEN) return { error: "Falta conectar Twilio: agrega TWILIO_ACCOUNT_SID y TWILIO_AUTH_TOKEN en los secretos de la función." };
-  const form = new URLSearchParams({ From: TW_FROM, To: to, Body: body, StatusCallback: `${BASE}/status` });
+  const froms = [...new Set([TW_FROM, SANDBOX])];
+  const tried: string[] = [];
+  let first = "";
   try {
-    const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TW_SID}/Messages.json`, {
-      method: "POST",
-      headers: { Authorization: "Basic " + btoa(`${TW_SID}:${TW_TOKEN}`), "Content-Type": "application/x-www-form-urlencoded" },
-      body: form,
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) return { error: explain(j.code, j.message) };
-    return { sid: j.sid };
+    for (const from of froms) {
+      for (const dest of mxVariants(to)) {
+        const r = await twilioOnce(from, dest, body);
+        if (r.sid) { lastRoute = `${from} > ${dest}`; return r; }
+        tried.push(`${from.replace("whatsapp:", "")} a ${dest.replace("whatsapp:", "")}`);
+        if (!first) first = r.error!;
+      }
+    }
+    return { error: `${first} Se intentó: ${tried.join("; ")}.` };
   } catch (e) {
     return { error: "No se pudo contactar a Twilio: " + (e as Error).message };
   }
@@ -331,7 +355,7 @@ async function say(patient: any, s: any, body: string, kind: string, extra: Reco
   await db.from("messages").insert({
     patient_id: patient.id, direction: "out", body, kind,
     status: res.sid ? "enviado" : "fallido", sent_at: new Date().toISOString(),
-    twilio_sid: res.sid ?? null, error: res.error ?? null, ...extra,
+    twilio_sid: res.sid ?? null, error: res.error ?? null, from_number: res.sid ? lastRoute : null, ...extra,
   });
   return res;
 }
@@ -385,7 +409,6 @@ async function handleInbound(p: Record<string, string>) {
   if (dup) return; // Twilio reintentó el mismo mensaje: ya está procesado.
   if (!patient) return; // Número desconocido: queda en la bandeja para revisarlo.
 
-  if (patient.wa_address !== from) { await setPatient(patient.id, { wa_address: from }); patient.wa_address = from; }
   const ctx = patient.conv_context ?? {};
   const state = patient.conv_state ?? "idle";
   const offered: Date[] = (ctx.slots ?? []).map((x: string) => new Date(x));
@@ -602,6 +625,7 @@ async function sendDue(s: any, now: Date) {
     else r = await twilioSend(waAddress(pt, s), m.body);
     await db.from("messages").update({
       status: r.sid ? "enviado" : "fallido", sent_at: new Date().toISOString(), twilio_sid: r.sid ?? null, error: r.error ?? null,
+      from_number: r.sid ? lastRoute : null,
     }).eq("id", m.id);
     if (r.sid) res.sent++; else { res.failed++; res.errors.push(r.error!); }
     if (r.sid) await sleep(3100); // el sandbox permite un mensaje cada 3 segundos
