@@ -151,7 +151,7 @@ function tracks() {
   return [...map.values()].map((t) => {
     const p = proc(t.procedure_id), pt = pat(t.patient_id);
     if (!p || !pt) return null;
-    const days = Math.floor((Date.now() - new Date(t.performed_at)) / DAY);
+    const days = Math.max(0, Math.floor((Date.now() - new Date(t.performed_at)) / DAY));
     const state = days >= p.window_max_days ? "fuera" : days >= p.window_min_days ? "ventana" : "antes";
     const rems = D.messages.filter((m) => m.treatment_id === t.id && m.kind === "recordatorio");
     return { t, p, pt, days, state, rems, appt: nextAppt(pt.id) };
