@@ -636,13 +636,29 @@ window.addEventListener("hashchange", () => { render(); window.scrollTo(0, 0); }
 function gate(html) { $("#app").innerHTML = `<div class="gate"><h1>Fideliza</h1>${html}</div>`; }
 function loginScreen(note = "") {
   gate(`<p class="muted">Entra con el correo que tiene acceso al consultorio.</p>${note ? `<div class="notice amber" style="margin-top:16px">${note}</div>` : ""}
-    <form id="login"><div class="field"><label for="le">Correo</label><input id="le" type="email" required autocomplete="email"></div><button class="primary" style="width:100%">Enviarme el enlace de acceso</button></form>`);
+    <form id="login"><div class="field"><label for="le">Correo</label><input id="le" type="email" required autocomplete="email"></div><button class="primary" style="width:100%">Enviarme el código de acceso</button></form>`);
   $("#login").addEventListener("submit", async (e) => {
     e.preventDefault();
     const email = $("#le").value.trim();
+    const btn = $("button", e.target); btn.disabled = true;
     const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname } });
-    if (error) return toast(error.message, true);
-    gate(`<p style="margin-top:8px">Te enviamos un enlace a <strong>${esc(email)}</strong>. Ábrelo en este mismo navegador para entrar.</p><p class="muted small" style="margin-top:12px">Si no llega en un minuto, revisa la carpeta de correo no deseado.</p>`);
+    btn.disabled = false;
+    if (error) return toast(/rate limit|security purposes/i.test(error.message) ? "Se pidieron demasiados correos seguidos. Espera unos minutos y vuelve a intentarlo, o usa el código del último correo." : error.message, true);
+    codeScreen(email);
+  });
+}
+function codeScreen(email) {
+  gate(`<p style="margin-top:8px">Te enviamos un correo a <strong>${esc(email)}</strong>. Escribe aquí el código que trae.</p>
+    <form id="code"><div class="field"><label for="lc">Código de acceso</label><input id="lc" inputmode="numeric" autocomplete="one-time-code" required pattern="[0-9 ]{6,12}"><div class="hint">Usa el correo más reciente; los anteriores dejan de servir. El código dura una hora.</div></div><button class="primary" style="width:100%">Entrar</button></form>
+    <p class="small" style="margin-top:16px"><button class="link" id="again">Usar otro correo o pedir un código nuevo</button></p>`);
+  $("#again").addEventListener("click", () => loginScreen());
+  $("#code").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const token = $("#lc").value.replace(/\D/g, "");
+    let r = await sb.auth.verifyOtp({ email, token, type: "email" });
+    if (r.error) r = await sb.auth.verifyOtp({ email, token, type: "signup" });
+    if (r.error) return toast("El código no es válido o ya venció. Revisa que sea el del correo más reciente o pide uno nuevo.", true);
+    if (!user) { user = r.data.user; boot(); }
   });
 }
 
@@ -653,7 +669,12 @@ async function start() {
   const { data } = await sb.auth.getSession();
   user = data.session?.user || null;
   sb.auth.onAuthStateChange((ev, session) => { if (ev === "SIGNED_IN" && !user) { user = session.user; boot(); } });
-  if (!user) return loginScreen();
+  if (!user) {
+    const h = new URLSearchParams(location.hash.slice(1));
+    const failed = h.get("error_code") || h.get("error");
+    if (failed) history.replaceState(null, "", location.pathname);
+    return loginScreen(failed ? (failed === "otp_expired" ? "Ese enlace ya venció o ya se había usado. Pide un código nuevo." : "No se pudo entrar con ese enlace. Pide un código nuevo.") : "");
+  }
   boot();
 }
 async function boot() {
