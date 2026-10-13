@@ -190,7 +190,7 @@ function tracks() {
 function todo(k) {
   if (k.appt) return "cita";
   if (k.t.snoozed_until && new Date(k.t.snoozed_until) > Date.now()) return "pospuesto";
-  if (k.pt.opted_out || !k.pt.consent || !hasPhone(k.pt) || !k.p.reminders_on) return "llamar";
+  if (k.pt.opted_out || !k.pt.consent || (!hasPhone(k.pt) && !k.pt.is_sample) || !k.p.reminders_on) return "llamar";
   if (k.rems.length >= Math.max(1, k.p.max_reminders)) return "llamar";
   if (k.rems.length) return "esperando";
   return "escribir";
