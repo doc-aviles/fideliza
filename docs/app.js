@@ -10,7 +10,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 
 let sb = null, api = null, user = null;
 let D = { settings: null, procedures: [], patients: [], treatments: [], appointments: [], messages: [], alerts: [], staff: [] };
-const ui = { week: 0, search: "", conn: null, pendingRefresh: false, msgFilter: "todos" };
+const ui = { week: 0, month: 0, day: null, showAppts: true, showDue: true, search: "", conn: null, pendingRefresh: false, msgFilter: "todos" };
 
 // ───────────── Fechas en la zona horaria del consultorio ─────────────
 const DOW = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
@@ -89,7 +89,7 @@ function mockApi() {
   let n = 1;
   const id = () => "m" + n++;
   const store = { settings: [MOCK_SETTINGS], procedures: [], patients: [], treatments: [], appointments: [], messages: [], alerts: [], staff: [{ email: "demo@fideliza.app", name: "Demostración" }] };
-  [["Toxina botulínica", 90, 120, 90, 3, 2, 30, 4400, [24]], ["Ácido hialurónico", 270, 365, 270, 7, 2, 45, 7500, [24, 168]], ["Hilos tensores", 365, 540, 365, 14, 2, 90, 15000, [24, 168]], ["Control GLP-1", 7, 9, 6, 2, 1, 20, 1800, []]]
+  [["Toxina botulínica", 90, 120, 90, 3, 2, 30, 4400, [24]], ["Ácido hialurónico", 270, 360, 270, 7, 2, 45, 7500, [24, 168]], ["Hilos tensores", 360, 540, 360, 14, 2, 90, 15000, [24, 168]], ["Control GLP-1", 7, 9, 6, 2, 1, 20, 1800, []]]
     .forEach(([name, a, b, c, d, e, f, g, h], i) => store.procedures.push({ id: id(), name, active: true, reminders_on: true, window_min_days: a, window_max_days: b, first_reminder_days: c, repeat_days: d, max_reminders: e, duration_min: f, price: g, postcare_on: h.length > 0, postcare_hours: h, sort: i, reminder_template: "Hola {nombre}, te escribe {consultorio}. Ya es buen momento para tu revaloración. ¿Te aparto un espacio esta semana?", postcare_template: "Hola {nombre}, ¿cómo te has sentido después de tu visita?" }));
   D.settings = MOCK_SETTINGS;
   const s = sampleRows(store.procedures);
@@ -141,6 +141,33 @@ const nextAppt = (pid) => D.appointments.filter((a) => a.patient_id === pid && [
 const STATUS = { programado: "Programado", enviando: "Enviando", enviado: "Enviado", entregado: "Entregado", leido: "Leído", fallido: "No se envió", recibido: "Recibido" };
 const KIND = { recordatorio: "Aviso de retoque", postcuidado: "Seguimiento", cita: "Recordatorio de cita", respuesta: "Asistente", alerta: "Aviso al médico", manual: "Escrito a mano" };
 
+// ───────────── Tiempos en palabras ─────────────
+const UNITS = { dias: [1, "día", "días"], semanas: [7, "semana", "semanas"], meses: [30, "mes", "meses"] };
+// Meses de 30 días; 365 días se lee como 12 meses.
+const nearMonths = (d) => d >= 56 && Math.abs(d - Math.round(d / 30) * 30) <= 5;
+function unitFor(...days) {
+  if (days.every(nearMonths)) return "meses";
+  if (days.every((d) => d >= 7 && d % 7 === 0)) return "semanas";
+  return "dias";
+}
+const inUnit = (d, u) => Math.round(d / UNITS[u][0]);
+const nUnit = (n, u) => `${n} ${n === 1 ? UNITS[u][1] : UNITS[u][2]}`;
+const durText = (d) => { const u = unitFor(d); return nUnit(inUnit(d, u), u); };
+function rangeText(a, b) {
+  const u = unitFor(a, b), x = inUnit(a, u), y = inUnit(b, u);
+  return x === y ? nUnit(x, u) : `${x} a ${nUnit(y, u)}`;
+}
+// Aproximado, para leer de un vistazo: "3 semanas", "2 meses"
+function approx(d) {
+  d = Math.abs(Math.round(d));
+  if (d < 14) return d === 1 ? "1 día" : `${d} días`;
+  if (d < 60) { const w = Math.round(d / 7); return w === 1 ? "1 semana" : `${w} semanas`; }
+  const m = Math.round(d / 30); return m === 1 ? "1 mes" : `${m} meses`;
+}
+const rel = (d) => (d === 0 ? "hoy" : d > 0 ? `en ${approx(d)}` : `hace ${approx(d)}`);
+const hoursText = (h) => (h % 24 === 0 ? durText(h / 24) : `${h} ${h === 1 ? "hora" : "horas"}`);
+const hasPhone = (p) => (p.phone || "").replace(/\D/g, "").length >= 10;
+
 // Última aplicación de cada procedimiento por paciente, con su ventana.
 function tracks() {
   const map = new Map();
@@ -151,31 +178,51 @@ function tracks() {
   return [...map.values()].map((t) => {
     const p = proc(t.procedure_id), pt = pat(t.patient_id);
     if (!p || !pt) return null;
-    const days = Math.max(0, Math.floor((Date.now() - new Date(t.performed_at)) / DAY));
+    const done = new Date(t.performed_at).getTime();
+    const days = Math.max(0, Math.floor((Date.now() - done) / DAY));
     const state = days >= p.window_max_days ? "fuera" : days >= p.window_min_days ? "ventana" : "antes";
     const rems = D.messages.filter((m) => m.treatment_id === t.id && m.kind === "recordatorio");
-    return { t, p, pt, days, state, rems, appt: nextAppt(pt.id) };
+    const due = new Date(done + p.window_min_days * DAY), until = new Date(done + p.window_max_days * DAY);
+    return { t, p, pt, days, state, rems, due, until, appt: nextAppt(pt.id) };
   }).filter(Boolean);
 }
+// Qué le toca hacer al consultorio con cada paciente.
+function todo(k) {
+  if (k.appt) return "cita";
+  if (k.t.snoozed_until && new Date(k.t.snoozed_until) > Date.now()) return "pospuesto";
+  if (k.pt.opted_out || !k.pt.consent || !hasPhone(k.pt) || !k.p.reminders_on) return "llamar";
+  if (k.rems.length >= Math.max(1, k.p.max_reminders)) return "llamar";
+  if (k.rems.length) return "esperando";
+  return "escribir";
+}
 function followText(k) {
-  if (k.pt.opted_out) return `<span class="tag red">Se dio de baja</span>`;
-  if (!k.pt.consent) return `<span class="tag amber">Sin autorización de WhatsApp</span>`;
+  if (k.pt.opted_out) return `<span class="tag red">Pidió no recibir mensajes</span>`;
+  if (!k.pt.consent) return `<span class="tag amber">No ha autorizado WhatsApp</span>`;
   if (k.appt) return `Tiene cita el ${esc(fDay(k.appt.starts_at))}`;
   if (k.pt.bot_paused) return `<span class="tag red">Asistente en pausa</span>`;
-  if (k.t.snoozed_until && new Date(k.t.snoozed_until) > Date.now()) return `Pospuesto hasta el ${esc(fDate(k.t.snoozed_until))}`;
-  if (!k.p.reminders_on || !k.p.active) return "Avisos apagados";
-  if (k.rems.length) return `${k.rems.length} de ${k.p.max_reminders} avisos · ${esc(STATUS[k.rems[0].status] || k.rems[0].status)}`;
-  if (k.days >= k.p.first_reminder_days) return "Sale en el siguiente horario de envío";
-  return `Primer aviso en ${k.p.first_reminder_days - k.days} días`;
+  if (k.t.snoozed_until && new Date(k.t.snoozed_until) > Date.now()) return `Dijo que después; se le vuelve a escribir el ${esc(fDate(k.t.snoozed_until))}`;
+  if (!k.p.reminders_on || !k.p.active) return "Avisos apagados para este tratamiento";
+  if (k.rems.length) {
+    const last = k.rems[0];
+    const read = last.status === "leido" ? "lo leyó" : last.status === "fallido" ? "no se pudo enviar" : "aún no lo lee";
+    return `Se le escribió ${rel(-Math.round((Date.now() - new Date(last.sent_at || last.created_at)) / DAY))} (${k.rems.length} de ${k.p.max_reminders}); ${read}`;
+  }
+  const first = k.p.first_reminder_days - k.days;
+  return first <= 0 ? "Se le escribe en el siguiente horario de envío" : `Se le escribe ${rel(first)}`;
+}
+function whenText(k) {
+  if (k.state === "antes") return `Le toca ${rel(k.p.window_min_days - k.days)}`;
+  if (k.state === "ventana") return k.days === k.p.window_min_days ? "Le toca desde hoy" : `Le toca desde hace ${approx(k.days - k.p.window_min_days)}`;
+  return `Se pasó por ${approx(k.days - k.p.window_max_days)}`;
 }
 function winBar(k, caption = false) {
   const scale = Math.max(k.p.window_max_days * 1.25, k.days * 1.05, 1);
   const pct = (n) => Math.min(100, (n / scale) * 100).toFixed(1);
-  const label = k.state === "fuera" ? `Fuera de ventana, día ${k.days}` : k.state === "ventana" ? `En ventana, día ${k.days}` : `Día ${k.days}; la ventana abre el día ${k.p.window_min_days}`;
+  const label = `${whenText(k)}. Periodo ideal: del ${fDate(k.due)} al ${fDate(k.until)}`;
   return `<div class="win ${k.state}" role="img" aria-label="${esc(label)}"><div class="zone" style="left:${pct(k.p.window_min_days)}%;width:${(pct(k.p.window_max_days) - pct(k.p.window_min_days)).toFixed(1)}%"></div><div class="now" style="left:${pct(k.days)}%"></div></div>` +
-    (caption ? `<div class="win-cap"><span>${esc(label)}</span><span>Ventana: día ${k.p.window_min_days} a ${k.p.window_max_days}</span></div>` : "");
+    (caption ? `<div class="win-cap"><span>${esc(whenText(k))}</span><span>Periodo ideal: ${esc(fmt(k.due, { day: "numeric", month: "short" }))} – ${esc(fDate(k.until))}</span></div>` : "");
 }
-const stateTag = (k) => k.state === "fuera" ? `<span class="tag red">Fuera de ventana</span>` : k.state === "ventana" ? `<span class="tag blue">En ventana</span>` : `<span class="tag">Aún no toca</span>`;
+const stateTag = (k) => k.state === "fuera" ? `<span class="tag red">Se pasó</span>` : k.state === "ventana" ? `<span class="tag blue">Ya le toca</span>` : `<span class="tag">Aún no le toca</span>`;
 
 // ───────────── Vistas ─────────────
 function viewHoy() {
@@ -193,13 +240,13 @@ function viewHoy() {
   const replied = new Set(D.messages.filter((m) => m.direction === "in" && inMonth(m.created_at) && reminded.has(m.patient_id)).map((m) => m.patient_id));
   const booked = D.appointments.filter((a) => a.source === "fideliza" && inMonth(a.created_at));
   const income = D.treatments.filter((t) => t.source === "fideliza" && inMonth(t.performed_at)).reduce((s, t) => s + Number(t.price || 0), 0);
-  const nIn = due.filter((k) => k.state === "ventana").length, nOut = due.length - nIn;
+  const pending = due.filter((k) => ["escribir", "llamar"].includes(todo(k))).length;
   const lastIn = (pid) => D.messages.find((m) => m.patient_id === pid && m.direction === "in");
 
   return `
   <div class="head"><div>
-    <h1>${nOut ? `${nOut} ${nOut === 1 ? "paciente ya salió" : "pacientes ya salieron"} de su ventana` : nIn ? `${nIn} ${nIn === 1 ? "paciente está" : "pacientes están"} en ventana de retoque` : "Todo al día"}</h1>
-    <p class="muted">${esc(fmt(Date.now(), { weekday: "long", day: "numeric", month: "long" }))} · ${nIn} en ventana · ${today.length} ${today.length === 1 ? "cita" : "citas"} hoy</p>
+    <h1>${pending ? `${pending} ${pending === 1 ? "paciente necesita" : "pacientes necesitan"} seguimiento` : "Todo al día"}</h1>
+    <p class="muted">${esc(fmt(Date.now(), { weekday: "long", day: "numeric", month: "long" }))} · ${today.length} ${today.length === 1 ? "cita" : "citas"} hoy</p>
   </div><button class="primary" data-act="new-patient">Nuevo paciente</button></div>
 
   ${D.settings.bot_enabled ? "" : `<div class="notice amber"><div><strong>El asistente está apagado.</strong> No saldrán avisos automáticos ni respuestas.</div><a href="#/config">Encender en Configuración</a></div>`}
@@ -209,14 +256,9 @@ function viewHoy() {
     <div class="acts"><a class="btn" href="#/paciente/${p.id}">Abrir conversación</a><button data-act="clear-attention" data-id="${p.id}">Ya lo atendí</button></div></div>`).join("")}
   ${unknown.map((m) => `<div class="notice"><div><strong>Mensaje de un número que no está registrado</strong> · ${esc((m.from_number || "").replace("whatsapp:", ""))}<br>${esc(m.body)}</div></div>`).join("")}
 
-  <section><div class="sec-head"><h2>Por recuperar</h2><span class="muted small">La franja azul es la ventana ideal para volver; la línea es hoy.</span></div>
-  <div class="sheet">${due.length ? `<table><thead><tr><th>Paciente</th><th>Procedimiento</th><th>Última vez</th><th style="width:190px">Ventana</th><th>Seguimiento</th><th></th></tr></thead><tbody>
-    ${due.map((k) => `<tr><td><a class="name" href="#/paciente/${k.pt.id}">${esc(k.pt.name)}</a></td><td>${esc(k.p.name)}</td>
-      <td>${esc(fDate(k.t.performed_at))}<div class="muted small">hace ${k.days} días</div></td><td>${winBar(k)}${stateTag(k)}</td>
-      <td class="small">${followText(k)}</td><td><button data-act="force" data-id="${k.t.id}">Enviar aviso ahora</button></td></tr>`).join("")}
-    </tbody></table>` : `<div class="empty">Nadie está en ventana todavía. Registra procedimientos en la ficha de cada paciente y aquí aparecerán cuando les toque volver.</div>`}</div></section>
+  ${workList(due)}
 
-  <section><div class="sec-head"><h2>Citas de hoy</h2><a href="#/agenda">Ver la semana</a></div>
+  <section><div class="sec-head"><h2>Citas de hoy</h2><a href="#/calendario">Ver calendario</a></div>
   <div class="sheet">${today.length ? `<table><tbody>${today.map((a) => `<tr><td style="width:80px"><strong>${esc(fTime(a.starts_at))}</strong></td><td><a class="name" href="#/paciente/${a.patient_id}">${esc(pat(a.patient_id)?.name || "")}</a></td><td>${esc(proc(a.procedure_id)?.name || "Valoración")}</td><td>${apptTag(a)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">No hay citas para hoy.</div>`}</div></section>
 
   <section><div class="sec-head"><h2>Este mes</h2></div><div class="figures">
@@ -225,6 +267,29 @@ function viewHoy() {
     <div><strong>${booked.length}</strong><span>citas agendadas por Fideliza</span></div>
     <div><strong>${money(income)}</strong><span>ingreso de pacientes que volvieron por un aviso</span></div>
   </div></section>`;
+}
+const ACTIONS = {
+  llamar: ["Llamar por teléfono", "Ya se le escribió sin respuesta, o no se le puede escribir por WhatsApp."],
+  escribir: ["Escribirle", "Ya le toca y todavía no se le ha escrito."],
+  esperando: ["Esperando respuesta", "Fideliza ya le escribió; si no contesta, vuelve a intentarlo solo."],
+  cita: ["Ya tiene cita", ""],
+  pospuesto: ["Dijo que después", "Se le volverá a escribir más adelante."],
+};
+function workList(due) {
+  if (!due.length) return `<section><div class="sec-head"><h2>Seguimiento</h2></div><div class="sheet"><div class="empty">Nadie necesita seguimiento por ahora. Cuando a un paciente le toque volver, aparecerá aquí.</div></div></section>`;
+  return ["llamar", "escribir", "esperando", "cita", "pospuesto"].map((g) => {
+    const list = due.filter((k) => todo(k) === g);
+    if (!list.length) return "";
+    const action = (k) => g === "llamar" ? (hasPhone(k.pt) ? `<a class="btn" href="tel:${esc(k.pt.phone)}">Llamar</a>` : `<a class="btn" href="#/paciente/${k.pt.id}">Ver ficha</a>`)
+      : g === "escribir" ? `<button data-act="force" data-id="${k.t.id}">Enviar aviso</button>`
+      : g === "cita" ? `<a class="btn" href="#/paciente/${k.pt.id}">Ver cita</a>` : `<a class="btn" href="#/paciente/${k.pt.id}">Ver ficha</a>`;
+    return `<section class="group-${g}"><div class="sec-head"><h2>${ACTIONS[g][0]} <span class="muted" style="font-weight:400">· ${list.length}</span></h2><span class="muted small">${ACTIONS[g][1]}</span></div>
+    <div class="sheet"><table><thead><tr><th>Paciente</th><th>Tratamiento</th><th>Le toca volver</th><th>Qué ha pasado</th><th></th></tr></thead><tbody>
+    ${list.map((k) => `<tr><td><a class="name" href="#/paciente/${k.pt.id}">${esc(k.pt.name)}</a>${g === "llamar" && hasPhone(k.pt) ? `<div class="muted small">${esc(k.pt.phone)}</div>` : ""}</td><td>${esc(k.p.name)}</td>
+      <td>${esc(fmt(k.due, { day: "numeric", month: "short" }))} ${stateTag(k)}<div class="muted small">${esc(whenText(k))}</div></td>
+      <td class="small">${followText(k)}</td><td style="text-align:right">${action(k)}</td></tr>`).join("")}
+    </tbody></table></div></section>`;
+  }).join("");
 }
 const apptTag = (a) => `<span class="tag ${a.status === "confirmada" ? "blue" : a.status === "cancelada" ? "red" : ""}">${{ agendada: "Agendada", confirmada: "Confirmada", atendida: "Atendida", cancelada: "Cancelada" }[a.status] || a.status}</span>${a.source === "fideliza" ? ` <span class="tag blue">Por Fideliza</span>` : ""}`;
 
@@ -275,6 +340,59 @@ function viewPaciente(id) {
   </div></div>`;
 }
 
+function calBar(mode) {
+  return `<div class="seg" role="group" aria-label="Vista"><a href="#/calendario/mes" ${mode === "mes" ? 'aria-current="page"' : ""}>Mes</a><a href="#/calendario/semana" ${mode === "semana" ? 'aria-current="page"' : ""}>Semana</a></div>`;
+}
+function viewCalendario(mode) {
+  if (mode === "semana") return viewAgenda();
+  const lp = localParts(new Date());
+  const first = new Date(Date.UTC(lp.y, lp.m - 1 + ui.month, 1, 12));
+  const month = first.getUTCMonth();
+  const start = new Date(first.getTime() - ((first.getUTCDay() + 6) % 7) * DAY);
+  const keyOf = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+  const todayKey = dayKey(Date.now());
+  const appts = {}, dues = {};
+  if (ui.showAppts) for (const a of D.appointments) if (a.status !== "cancelada") (appts[dayKey(a.starts_at)] ||= []).push(a);
+  if (ui.showDue) for (const k of tracks()) if (!k.appt && !k.pt.opted_out && k.p.active) (dues[dayKey(k.due)] ||= []).push(k);
+  Object.values(appts).forEach((l) => l.sort((a, b) => new Date(a.starts_at) - new Date(b.starts_at)));
+  const weeks = [];
+  for (let d = start; weeks.length < 6; ) {
+    const row = [];
+    for (let i = 0; i < 7; i++, d = new Date(d.getTime() + DAY)) row.push(d);
+    weeks.push(row);
+    if (d.getUTCMonth() !== month) break;
+  }
+  const sel = ui.day || (ui.month === 0 ? todayKey : keyOf(first));
+  const cell = (d) => {
+    const k = keyOf(d), a = appts[k] || [], r = dues[k] || [];
+    const chips = [...a.map((x) => `<span class="chip appt"><b>${esc(fTime(x.starts_at))}</b> ${esc(firstWords(pat(x.patient_id)?.name))}</span>`),
+      ...r.map((x) => `<span class="chip due ${k < todayKey ? "late" : ""}">${esc(firstWords(x.pt.name))}</span>`)];
+    const label = `${fmt(new Date(d.getTime()), { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" })}: ${a.length} ${a.length === 1 ? "cita" : "citas"}, ${r.length} por volver`;
+    return `<button class="cal-day ${d.getUTCMonth() !== month ? "out" : ""} ${k === todayKey ? "today" : ""} ${k === sel ? "sel" : ""}" data-act="cal-day" data-key="${k}" aria-label="${esc(label)}">
+      <span class="num">${d.getUTCDate()}</span>${chips.slice(0, 3).join("")}${chips.length > 3 ? `<span class="more">${chips.length - 3} más</span>` : ""}
+      <span class="dots">${a.length ? `<i class="d-appt">${a.length}</i>` : ""}${r.length ? `<i class="d-due">${r.length}</i>` : ""}</span></button>`;
+  };
+  const selA = appts[sel] || [], selR = dues[sel] || [];
+  const [sy, sm, sd] = sel.split("-").map(Number);
+  const selDate = new Date(Date.UTC(sy, sm - 1, sd, 12));
+  const monthName = new Intl.DateTimeFormat("es-MX", { month: "long", year: "numeric", timeZone: "UTC" }).format(first);
+  return `
+  <div class="head"><div><h1>${esc(cap(monthName))}</h1><p class="muted">Citas agendadas y pacientes a los que les toca volver.</p></div>
+    <div class="toolbar">${calBar("mes")}<button data-act="month" data-d="-1" aria-label="Mes anterior">Anterior</button><button data-act="month" data-d="0">Hoy</button><button data-act="month" data-d="1" aria-label="Mes siguiente">Siguiente</button></div></div>
+  <div class="legend"><label><input type="checkbox" data-toggle="showAppts" ${ui.showAppts ? "checked" : ""}><span class="chip appt">Cita</span></label>
+    <label><input type="checkbox" data-toggle="showDue" ${ui.showDue ? "checked" : ""}><span class="chip due">Le toca volver</span></label>
+    <span class="chip due late">Ya se pasó y no ha agendado</span></div>
+  <div class="cal" role="grid"><div class="cal-head">${["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"].map((x) => `<span>${x}</span>`).join("")}</div>
+    ${weeks.map((w) => `<div class="cal-row">${w.map(cell).join("")}</div>`).join("")}</div>
+  <section><div class="sec-head"><h2>${esc(cap(new Intl.DateTimeFormat("es-MX", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" }).format(selDate)))}</h2><button class="primary" data-act="new-appt">Nueva cita</button></div>
+  <div class="cols">
+    <div class="panel"><h2>Citas</h2>${selA.length ? `<div class="rows">${selA.map((a) => `<div><span><strong>${esc(fTime(a.starts_at))}</strong> · <a class="name" href="#/paciente/${a.patient_id}">${esc(pat(a.patient_id)?.name || "")}</a><br><span class="muted small">${esc(proc(a.procedure_id)?.name || "Valoración")}</span></span><span>${apptTag(a)} <button class="link" data-act="open-appt" data-id="${a.id}">Cambiar</button></span></div>`).join("")}</div>` : `<p class="muted">Sin citas este día.</p>`}</div>
+    <div class="panel"><h2>Les toca volver</h2>${selR.length ? `<div class="rows">${selR.map((k) => `<div><span><a class="name" href="#/paciente/${k.pt.id}">${esc(k.pt.name)}</a><br><span class="muted small">${esc(k.p.name)} · ${followText(k)}</span></span><span>${todo(k) === "escribir" ? `<button data-act="force" data-id="${k.t.id}">Enviar aviso</button>` : todo(k) === "llamar" && hasPhone(k.pt) ? `<a class="btn" href="tel:${esc(k.pt.phone)}">Llamar</a>` : ""} <button data-act="new-appt" data-id="${k.pt.id}">Agendar</button></span></div>`).join("")}</div>` : `<p class="muted">A nadie le toca volver este día.</p>`}</div>
+  </div></section>`;
+}
+const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+const firstWords = (n) => (n || "").trim().split(/\s+/).slice(0, 2).join(" ");
+
 function viewAgenda() {
   const lp = localParts(new Date());
   const monday = Date.UTC(lp.y, lp.m - 1, lp.d - (lp.dow - 1) + 7 * ui.week, 12);
@@ -292,7 +410,7 @@ function viewAgenda() {
   return `
   <div class="head"><div><h1>Semana del ${label(new Date(monday))} al ${label(new Date(monday + 6 * DAY))}</h1>
     <p class="muted">${total} ${total === 1 ? "cita" : "citas"}${byF ? ` · ${byF} agendadas por Fideliza` : ""}</p></div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap"><button data-act="week" data-d="-1">Semana anterior</button><button data-act="week" data-d="0">Hoy</button><button data-act="week" data-d="1">Semana siguiente</button><button class="primary" data-act="new-appt">Nueva cita</button></div></div>
+    <div class="toolbar">${calBar("semana")}<button data-act="week" data-d="-1">Semana anterior</button><button data-act="week" data-d="0">Hoy</button><button data-act="week" data-d="1">Semana siguiente</button><button class="primary" data-act="new-appt">Nueva cita</button></div></div>
   <div class="week">${days.map((x) => `<div class="day ${x.key === todayKey ? "today" : ""}"><header><span>${names[x.i]}</span><span>${x.d.getUTCDate()}</span></header>
     ${x.list.length ? x.list.map((a) => `<button class="appt ${a.status}" data-act="open-appt" data-id="${a.id}"><span class="t">${esc(fTime(a.starts_at))}</span> ${esc(pat(a.patient_id)?.name || "")}<br><span class="muted small">${esc(proc(a.procedure_id)?.name || "Valoración")}${a.status === "confirmada" ? " · confirmada" : a.status === "atendida" ? " · atendida" : ""}</span>${a.source === "fideliza" ? `<br><span class="by">Agendada por Fideliza</span>` : ""}</button>`).join("") : `<div class="empty small">Sin citas</div>`}</div>`).join("")}</div>`;
 }
@@ -322,83 +440,91 @@ const fBool = (name, label) => `<label class="check"><input type="checkbox" name
 const save = `<div class="save-row"><button class="primary">Guardar cambios</button></div>`;
 const VARS = "Puedes usar {nombre}, {consultorio} y {doctor}.";
 
-function viewConfig() {
+// Lista desplegable con opciones fijas; conserva el valor actual aunque no esté en la lista.
+function options(list, value, label = (v) => v) {
+  const vals = list.includes(Number(value)) ? list : [...list, Number(value)].sort((a, b) => a - b);
+  return vals.map((v) => `<option value="${v}" ${Number(value) === v ? "selected" : ""}>${esc(label(v))}</option>`).join("");
+}
+const fSel = (name, label, list, lab, hint = "") => `<div class="field"><label for="f-${name}">${label}</label><select id="f-${name}" name="${name}" data-type="int">${options(list, D.settings[name], lab)}</select>${hint ? `<div class="hint">${hint}</div>` : ""}</div>`;
+const POST = [[24, "Al día siguiente"], [72, "A los 3 días"], [168, "A la semana"], [336, "A las 2 semanas"]];
+
+function procCard(p) {
+  const u = unitFor(p.window_min_days, p.window_max_days);
+  const before = Math.max(0, p.window_min_days - p.first_reminder_days);
+  const post = [...POST, ...(p.postcare_hours || []).filter((h) => !POST.some(([v]) => v === h)).map((h) => [h, `A ${hoursText(h)}`])];
+  const summary = p.reminders_on ? `vuelve cada ${rangeText(p.window_min_days, p.window_max_days)} · ${p.max_reminders} ${p.max_reminders === 1 ? "aviso" : "avisos"}` : "sin avisos automáticos";
+  return `<details class="proc-card"><summary><span class="name">${esc(p.name)}</span><span class="muted small">${p.active ? esc(summary) : "Inactivo"}</span></summary>
+  <form data-form="proc" data-id="${p.id}">
+    <div class="field" style="max-width:420px"><label>Nombre del tratamiento</label><input type="text" name="name" value="${esc(p.name)}" required></div>
+    <fieldset><legend>¿Cuándo le toca volver?</legend>
+      <div class="say">Entre <input class="n" type="number" min="0" name="win_min_n" value="${inUnit(p.window_min_days, u)}" aria-label="Desde"> y <input class="n" type="number" min="1" name="win_max_n" value="${inUnit(p.window_max_days, u)}" aria-label="Hasta">
+        <select name="win_u" aria-label="Unidad">${Object.keys(UNITS).map((x) => `<option value="${x}" ${x === u ? "selected" : ""}>${UNITS[x][2]}</option>`).join("")}</select> después de su aplicación.</div></fieldset>
+    <fieldset><legend>Avisos por WhatsApp</legend>
+      <label class="check"><input type="checkbox" name="reminders_on" ${p.reminders_on ? "checked" : ""}>Escribirle cuando le toque volver</label>
+      <div class="say">Primer mensaje: <select name="first_before" aria-label="Cuándo sale el primer mensaje">${options([0, 3, 7, 14], before, (v) => (v === 0 ? "el día que le toca" : `${durText(v)} antes`))}</select></div>
+      <div class="say">Si no contesta, volver a escribirle a los <select name="repeat_days" aria-label="Cada cuánto repetir">${options([2, 3, 5, 7, 14], p.repeat_days, durText)}</select> y hasta <select name="max_reminders" aria-label="Máximo de mensajes">${options([1, 2, 3], p.max_reminders, (v) => `${v} ${v === 1 ? "mensaje" : "mensajes"}`)}</select> en total.</div>
+      <p class="hint">Después de eso aparece en «Hoy» en la lista para llamarle por teléfono.</p></fieldset>
+    <fieldset><legend>Después del tratamiento, preguntar cómo se siente</legend>
+      <div class="days">${post.map(([h, t]) => `<label><input type="checkbox" name="postcare_h" value="${h}" ${p.postcare_on && (p.postcare_hours || []).includes(h) ? "checked" : ""}>${esc(t)}</label>`).join("")}</div></fieldset>
+    <div class="grid2"><div class="field"><label>Precio habitual (pesos)</label><input type="number" min="0" name="price" value="${Number(p.price)}"></div><div class="field"><label>La cita dura</label><select name="duration_min">${options([15, 20, 30, 45, 60, 90, 120], p.duration_min, (v) => (v < 60 ? `${v} minutos` : v === 60 ? "1 hora" : `${v / 60} horas`.replace(".5", " y media")))}</select></div></div>
+    <details class="more"><summary>Textos de los mensajes</summary>
+      <div class="field"><label>Mensaje cuando le toca volver</label><textarea name="reminder_template">${esc(p.reminder_template)}</textarea><div class="hint">${VARS} Mejor no nombrar el tratamiento: WhatsApp no es para datos clínicos.</div></div>
+      <div class="field"><label>Mensaje para preguntar cómo se siente</label><textarea name="postcare_template">${esc(p.postcare_template)}</textarea></div></details>
+    <div class="save-row"><button class="primary">Guardar</button><label class="check" style="margin:0"><input type="checkbox" name="active" ${p.active ? "checked" : ""}>Tratamiento activo</label></div>
+  </form></details>`;
+}
+
+function viewConfig(tab) {
   const s = D.settings;
   const fnBase = cfg.url ? `${cfg.url}/functions/v1/fideliza` : "";
-  return `
-  <div class="head"><div><h1>Configuración</h1><p class="muted">Aquí decides cuándo escribe Fideliza, qué dice y cómo responde.</p></div></div>
-  <div class="config"><nav aria-label="Secciones"><a href="#/config" data-jump="c-clinic">Consultorio</a><a href="#/config" data-jump="c-send">Horario de envío</a><a href="#/config" data-jump="c-proc">Procedimientos</a><a href="#/config" data-jump="c-bot">Respuestas del asistente</a><a href="#/config" data-jump="c-agenda">Agenda y citas</a><a href="#/config" data-jump="c-wa">WhatsApp</a><a href="#/config" data-jump="c-team">Equipo</a><a href="#/config" data-jump="c-sample">Datos de ejemplo</a></nav><div>
-
-  <form class="panel" id="c-clinic" data-form="settings"><h2>Consultorio</h2><div class="grid2">${fText("clinic_name", "Nombre del consultorio", "Así se presenta en los mensajes: {consultorio}.")}${fText("doctor_name", "Nombre del médico", "Se usa como {doctor}.")}</div>
-    ${fBool("bot_enabled", "Asistente encendido: envía avisos y responde automáticamente")}${save}</form>
-
-  <form class="panel" id="c-send" data-form="settings"><h2>Horario de envío</h2><p class="muted small" style="margin-bottom:12px">Los avisos automáticos solo salen en estos días y horas. Las respuestas a un paciente que escribe salen siempre.</p>
-    ${fDays("send_days", "Días en que pueden salir avisos")}<div class="grid4">${fTimeIn("send_start", "Desde")}${fTimeIn("send_end", "Hasta")}${fNum("reply_delay_seconds", "Segundos antes de responder", "Entre 0 y 20. Una pausa corta se siente más natural.")}</div>${save}</form>
-
-  <div class="panel" id="c-proc"><h2>Procedimientos y tiempos de retoque</h2><p class="muted small" style="margin-bottom:16px">Cada procedimiento tiene su propia ventana y sus propios avisos. Todos los tiempos cuentan desde el día de la aplicación.</p>
-    ${D.procedures.map((p) => `<form class="proc" data-form="proc" data-id="${p.id}">
-      <div class="proc-head"><input type="text" name="name" value="${esc(p.name)}" aria-label="Nombre del procedimiento"><label class="check" style="margin:0"><input type="checkbox" name="active" ${p.active ? "checked" : ""}>Activo</label><label class="check" style="margin:0"><input type="checkbox" name="reminders_on" ${p.reminders_on ? "checked" : ""}>Avisos de retoque</label></div>
-      <div class="grid4">
-        <div class="field"><label>La ventana abre el día</label><input type="number" min="0" name="window_min_days" value="${p.window_min_days}"></div>
-        <div class="field"><label>La ventana cierra el día</label><input type="number" min="1" name="window_max_days" value="${p.window_max_days}"></div>
-        <div class="field"><label>Primer aviso el día</label><input type="number" min="0" name="first_reminder_days" value="${p.first_reminder_days}"></div>
-        <div class="field"><label>Repetir cada (días)</label><input type="number" min="1" name="repeat_days" value="${p.repeat_days}"></div>
-        <div class="field"><label>Máximo de avisos</label><input type="number" min="0" name="max_reminders" value="${p.max_reminders}"></div>
-        <div class="field"><label>Duración de la cita (min)</label><input type="number" min="5" name="duration_min" value="${p.duration_min}"></div>
-        <div class="field"><label>Precio habitual (MXN)</label><input type="number" min="0" name="price" value="${Number(p.price)}"></div>
-      </div>
-      <div class="field"><label>Mensaje del aviso de retoque</label><textarea name="reminder_template">${esc(p.reminder_template)}</textarea><div class="hint">${VARS} Evita nombrar el procedimiento: WhatsApp no es un canal para datos clínicos.</div></div>
-      <label class="check"><input type="checkbox" name="postcare_on" ${p.postcare_on ? "checked" : ""}>Preguntar cómo se siente después del procedimiento</label>
-      <div class="grid2"><div class="field"><label>Horas después de la aplicación</label><input type="text" name="postcare_hours" value="${esc((p.postcare_hours || []).join(", "))}"><div class="hint">Varias, separadas por comas. Ejemplo: 24, 168 (un día y una semana).</div></div></div>
-      <div class="field"><label>Mensaje de seguimiento</label><textarea name="postcare_template">${esc(p.postcare_template)}</textarea></div>
-      <div class="save-row"><button class="primary">Guardar ${esc(p.name)}</button></div></form>`).join("")}
-    <div class="proc"><button data-act="new-proc">Agregar procedimiento</button></div></div>
-
-  <form class="panel" id="c-bot" data-form="settings"><h2>Respuestas del asistente</h2>
-    ${fArea("tpl_offer", "Cuando el paciente quiere cita: ofrecer horarios", VARS + " {horarios} es la lista numerada de espacios libres.")}
-    ${fArea("tpl_booked", "Cuando elige un horario", VARS + " También {fecha} y {hora}.")}
-    ${fArea("tpl_no_slots", "Cuando no hay espacios libres")}
-    ${fArea("tpl_declined", "Cuando dice que ahora no")}
-    ${fNum("snooze_days", "Si dice que no, dejar de avisarle por (días)")}
-    ${fBool("fallback_on", "Responder cuando no se entiende el mensaje (una persona del consultorio lo verá en «Hoy»)")}
-    ${fArea("tpl_fallback", "Cuando no se entiende el mensaje")}
-    ${fArea("tpl_postcare_ok", "Cuando contesta que se siente bien")}
-    ${fArea("tpl_optout", "Cuando pide ya no recibir mensajes")}
-    <h3 style="margin:8px 0 12px">Palabras que entiende</h3>
-    ${fWords("yes_words", "Significan «sí, quiero cita»")}${fWords("no_words", "Significan «ahora no»")}${fWords("optout_words", "Para darse de baja")}
-    <h3 style="margin:8px 0 12px">Síntomas de alarma</h3>
-    <p class="muted small" style="margin-bottom:12px">Si un mensaje contiene alguna de estas palabras, el asistente deja de contestar, avisa al médico y el caso aparece en rojo en «Hoy».</p>
-    ${fWords("alarm_words", "Palabras de alarma", "Separadas por comas. También detecta variantes: «dolor» detecta «dolorcito».")}
-    ${fArea("tpl_alarm_patient", "Respuesta al paciente")}
-    ${fArea("tpl_alarm_doctor", "Aviso que recibe el médico", "Puedes usar {nombre}, {telefono} y {mensaje}.")}${save}</form>
-
-  <form class="panel" id="c-agenda" data-form="settings"><h2>Agenda y citas</h2>
-    ${fDays("work_days", "Días de consulta")}<div class="grid4">${fTimeIn("day_start", "Primera cita")}${fTimeIn("day_end", "Fin de la jornada")}${fNum("slot_minutes", "Citas cada (min)", "", { min: 5 })}${fNum("default_duration_min", "Duración por defecto (min)", "", { min: 5 })}</div>
-    <div class="grid4">${fNum("slots_to_offer", "Horarios a ofrecer", "", { min: 1 })}${fNum("min_notice_hours", "Anticipación mínima (horas)")}${fNum("horizon_days", "Ofrecer hasta (días adelante)", "", { min: 1 })}</div>
-    ${fBool("appt_reminder_on", "Recordar la cita y pedir confirmación")}
-    <div class="grid4">${fNum("appt_reminder_hours", "Horas antes de la cita", "", { min: 1 })}</div>
-    ${fArea("tpl_appt_reminder", "Mensaje de recordatorio de cita", VARS + " También {fecha} y {hora}.")}
-    ${fArea("tpl_appt_confirmed", "Cuando confirma")}${fArea("tpl_appt_cancelled", "Cuando cancela (después se le ofrecen nuevos horarios)")}${save}</form>
-
-  <form class="panel" id="c-wa" data-form="settings"><h2>WhatsApp</h2>
-    <div class="grid2"><div class="field"><label for="f-alert_whatsapp">WhatsApp del médico para avisos de alarma</label><input id="f-alert_whatsapp" name="alert_whatsapp" type="tel" data-type="phone" value="${esc(s.alert_whatsapp)}"><div class="hint">10 dígitos. Ahí llega el aviso cuando un paciente reporta una molestia.</div></div>
-    <div class="field"><label for="f-mx_prefix">Formato de los números de México</label><select id="f-mx_prefix" name="mx_prefix"><option value="+521" ${s.mx_prefix === "+521" ? "selected" : ""}>+521 (habitual en WhatsApp)</option><option value="+52" ${s.mx_prefix === "+52" ? "selected" : ""}>+52</option></select><div class="hint">Si los mensajes no llegan a un número mexicano, prueba el otro formato.</div></div></div>
-    ${fText("sandbox_join_code", "Código de prueba de Twilio", "El texto «join …» que muestra Twilio. Solo sirve para recordárselo a quien vaya a probar.")}
-    ${save}
-    <div class="proc"><h3>Estado de la conexión</h3><p class="small" id="conn" style="margin:6px 0 10px">${ui.conn ? connText() : "Pulsa el botón para comprobarla."}</p><button type="button" data-act="check-conn">Comprobar conexión</button></div>
-    <div class="proc"><h3>Cómo probar con un celular (modo de prueba de Twilio)</h3><ol class="steps small">
-      <li>Desde el celular que va a recibir los mensajes, envía por WhatsApp <code>${esc(s.sandbox_join_code || "join tu-codigo")}</code> al <code>+1 415 523 8886</code>.</li>
-      <li>Registra ese celular como paciente, marca que autorizó WhatsApp y agrégale un procedimiento con fecha de hace unos meses.</li>
-      <li>En «Hoy», pulsa «Enviar aviso ahora». Responde desde el celular y verás la cita aparecer en la agenda.</li></ol>
-      <p class="muted small" style="margin-top:8px">En modo de prueba, cada celular debe reenviar el código cada 3 días y solo recibe mensajes libres durante las 24 horas posteriores a su último mensaje.</p>
-      ${fnBase ? `<p class="small" style="margin-top:10px">Dirección que va en Twilio, en «When a message comes in»: <code>${esc(fnBase)}/inbound</code></p>` : ""}</div></form>
-
-  <div class="panel" id="c-team"><h2>Equipo con acceso</h2><div class="rows">${D.staff.map((x) => `<div><span>${esc(x.email)}</span>${x.email.toLowerCase() === (user?.email || "").toLowerCase() ? `<span class="muted small">Tú</span>` : `<button class="link danger" data-act="del-staff" data-id="${esc(x.email)}">Quitar acceso</button>`}</div>`).join("")}</div>
-    <form data-form="staff" class="composer"><div style="flex:1"><label for="st">Dar acceso a otro correo</label><input id="st" name="email" type="email" required></div><button>Dar acceso</button></form></div>
-
-  <div class="panel" id="c-sample"><h2>Datos de ejemplo</h2><p class="muted small" style="margin-bottom:12px">Carga ocho pacientes ficticios para enseñar la aplicación. No tienen teléfono ni autorización, así que nunca reciben mensajes.</p>
-    <div style="display:flex;gap:8px;flex-wrap:wrap"><button data-act="load-sample">Cargar pacientes de ejemplo</button>${D.patients.some((p) => p.is_sample) ? `<button class="danger" data-act="del-sample">Quitar pacientes de ejemplo</button>` : ""}</div></div>
-  </div></div>`;
+  const tabs = [["tratamientos", "Tratamientos"], ["horarios", "Horarios y citas"], ["mensajes", "Respuestas automáticas"], ["consultorio", "Consultorio y WhatsApp"]];
+  const body = {
+    tratamientos: () => `<p class="muted" style="margin-bottom:14px">Abre un tratamiento para ver o cambiar cada cuándo vuelve el paciente y cuándo se le escribe.</p>
+      ${D.procedures.map(procCard).join("")}<div style="margin-top:14px"><button data-act="new-proc">Agregar tratamiento</button></div>`,
+    horarios: () => `
+      <form class="panel" data-form="settings"><h2>Cuándo puede escribir Fideliza</h2><p class="muted small" style="margin-bottom:12px">Los avisos solo salen en estos días y horas. Si un paciente escribe, se le contesta a cualquier hora.</p>
+        ${fDays("send_days", "Días")}<div class="grid4">${fTimeIn("send_start", "Desde")}${fTimeIn("send_end", "Hasta")}</div>${save}</form>
+      <form class="panel" data-form="settings"><h2>Horario del consultorio</h2>
+        ${fDays("work_days", "Días de consulta")}<div class="grid4">${fTimeIn("day_start", "Primera cita")}${fTimeIn("day_end", "Última cita termina a las")}${fSel("slot_minutes", "Citas cada", [10, 15, 20, 30, 60], (v) => `${v} minutos`)}</div>${save}</form>
+      <form class="panel" data-form="settings"><h2>Cuando el paciente quiere cita</h2>
+        <div class="grid4">${fSel("slots_to_offer", "Horarios que se le ofrecen", [2, 3, 4, 5], (v) => `${v} opciones`)}${fSel("min_notice_hours", "No ofrecer antes de", [1, 2, 3, 6, 12, 24, 48], (v) => hoursText(v))}${fSel("horizon_days", "Buscar espacios en los próximos", [7, 14, 21, 30], durText)}${fSel("default_duration_min", "Duración de una valoración", [15, 20, 30, 45, 60], (v) => `${v} minutos`)}</div>
+        ${fBool("appt_reminder_on", "Recordarle la cita y pedirle que confirme")}
+        <div class="grid4">${fSel("appt_reminder_hours", "Recordarle", [2, 3, 6, 12, 24, 48], (v) => `${hoursText(v)} antes`)}</div>${save}</form>`,
+    mensajes: () => `<form class="panel" data-form="settings"><h2>Respuestas automáticas</h2><p class="muted small" style="margin-bottom:12px">${VARS} En los mensajes de cita también {fecha} y {hora}.</p>
+        ${fArea("tpl_offer", "Cuando quiere cita (ofrecer horarios)", "{horarios} es la lista de espacios libres.")}
+        ${fArea("tpl_booked", "Cuando elige un horario")}
+        ${fArea("tpl_declined", "Cuando dice que ahora no")}
+        <div class="grid4">${fSel("snooze_days", "Volver a escribirle después de", [7, 14, 30, 60, 90], durText, "Si dijo que ahora no.")}</div>
+        ${fArea("tpl_appt_reminder", "Recordatorio de cita")}
+        ${fArea("tpl_appt_confirmed", "Cuando confirma la cita")}${fArea("tpl_appt_cancelled", "Cuando cancela la cita (luego se le ofrecen horarios)")}
+        ${fArea("tpl_postcare_ok", "Cuando dice que se siente bien")}
+        ${fBool("fallback_on", "Contestar cuando no se entiende el mensaje (alguien del consultorio lo verá en «Hoy»)")}
+        ${fArea("tpl_fallback", "Cuando no se entiende el mensaje")}
+        ${fArea("tpl_no_slots", "Cuando no hay espacios libres")}
+        ${fArea("tpl_optout", "Cuando pide ya no recibir mensajes")}
+        <h3 style="margin:10px 0">Si reporta una molestia</h3><p class="muted small" style="margin-bottom:12px">Si el mensaje trae alguna palabra de alarma, el asistente deja de contestar, avisa al médico y el caso aparece en rojo en «Hoy».</p>
+        ${fArea("tpl_alarm_patient", "Respuesta al paciente")}${fArea("tpl_alarm_doctor", "Aviso al médico", "También {telefono} y {mensaje}.")}
+        <details class="more"><summary>Palabras que entiende el asistente</summary>
+          ${fWords("yes_words", "Quiere cita")}${fWords("no_words", "Ahora no")}${fWords("optout_words", "Ya no quiere mensajes")}${fWords("alarm_words", "Palabras de alarma", "Separadas por comas. «dolor» también detecta «dolorcito».")}</details>${save}</form>`,
+    consultorio: () => `
+      <form class="panel" data-form="settings"><h2>Consultorio</h2><div class="grid2">${fText("clinic_name", "Nombre del consultorio", "Así se presenta en los mensajes.")}${fText("doctor_name", "Nombre del médico")}</div>
+        ${fBool("bot_enabled", "Asistente encendido (envía avisos y contesta solo)")}
+        <div class="grid2"><div class="field"><label for="f-alert_whatsapp">WhatsApp del médico para avisos de molestias</label><input id="f-alert_whatsapp" name="alert_whatsapp" type="tel" data-type="phone" value="${esc(s.alert_whatsapp)}"></div>
+        ${fSel("reply_delay_seconds", "Esperar antes de contestar", [0, 3, 5, 10], (v) => (v ? `${v} segundos` : "Nada"))}</div>${save}</form>
+      <form class="panel" data-form="settings"><h2>WhatsApp</h2>
+        <div class="grid2"><div class="field"><label for="f-mx_prefix">Formato de los celulares de México</label><select id="f-mx_prefix" name="mx_prefix"><option value="+521" ${s.mx_prefix === "+521" ? "selected" : ""}>+521</option><option value="+52" ${s.mx_prefix === "+52" ? "selected" : ""}>+52</option></select><div class="hint">Fideliza prueba los dos si uno falla.</div></div>
+        ${fText("sandbox_join_code", "Código de prueba de Twilio", "El texto «join …» para quien vaya a probar.")}</div>${save}
+        <div class="proc"><h3>Estado de la conexión</h3><p class="small" id="conn" style="margin:6px 0 10px">${ui.conn ? connText() : "Pulsa el botón para comprobarla."}</p><button type="button" data-act="check-conn">Comprobar conexión</button></div>
+        ${fnBase ? `<p class="small muted" style="margin-top:12px">Dirección para Twilio («When a message comes in»): <code>${esc(fnBase)}/inbound</code></p>` : ""}</form>
+      <div class="panel"><h2>Equipo con acceso</h2><div class="rows">${D.staff.map((x) => `<div><span>${esc(x.email)}</span>${x.email.toLowerCase() === (user?.email || "").toLowerCase() ? `<span class="muted small">Tú</span>` : `<button class="link danger" data-act="del-staff" data-id="${esc(x.email)}">Quitar acceso</button>`}</div>`).join("")}</div>
+        <form data-form="staff" class="composer"><div style="flex:1"><label for="st">Dar acceso a otro correo (por ejemplo, la asistente)</label><input id="st" name="email" type="email" required></div><button>Dar acceso</button></form></div>
+      <div class="panel"><h2>Datos de ejemplo</h2><p class="muted small" style="margin-bottom:12px">Ocho pacientes ficticios para enseñar la aplicación. No tienen teléfono, así que nunca reciben mensajes.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap"><button data-act="load-sample">Cargar pacientes de ejemplo</button>${D.patients.some((p) => p.is_sample) ? `<button class="danger" data-act="del-sample">Quitar pacientes de ejemplo</button>` : ""}</div></div>`,
+  };
+  const cur = body[tab] ? tab : "tratamientos";
+  return `<div class="head"><div><h1>Configuración</h1></div></div>
+  <nav class="tabs" aria-label="Secciones">${tabs.map(([k, t]) => `<a href="#/config/${k}" ${k === cur ? 'aria-current="page"' : ""}>${t}</a>`).join("")}</nav>
+  <div class="config-body">${body[cur]()}</div>`;
 }
 function connText() {
   const c = ui.conn;
@@ -413,12 +539,12 @@ function route() {
 }
 function render() {
   const r = route();
-  const view = { hoy: viewHoy, pacientes: viewPacientes, paciente: () => viewPaciente(r.arg), agenda: viewAgenda, mensajes: viewMensajes, config: viewConfig }[r.name] || viewHoy;
+  const view = { hoy: viewHoy, pacientes: viewPacientes, paciente: () => viewPaciente(r.arg), calendario: () => viewCalendario(r.arg || "mes"), agenda: () => viewCalendario("semana"), mensajes: viewMensajes, config: () => viewConfig(r.arg || "tratamientos") }[r.name] || viewHoy;
   const n = D.alerts.filter((a) => !a.resolved_at).length + D.patients.filter((p) => p.needs_attention).length;
-  const link = (h, t, extra = "") => `<a href="#/${h}" ${r.name === h || (h === "pacientes" && r.name === "paciente") ? 'aria-current="page"' : ""}>${t}${extra}</a>`;
+  const link = (h, t, extra = "") => `<a href="#/${h}" ${r.name === h || (h === "pacientes" && r.name === "paciente") || (h === "calendario" && r.name === "agenda") ? 'aria-current="page"' : ""}>${t}${extra}</a>`;
   $("#app").innerHTML = `
   <header class="top"><div class="top-in"><a class="brand" href="#/hoy">Fideliza</a>
-    <nav class="nav" aria-label="Principal">${link("hoy", "Hoy", n ? `<span class="count">${n}</span>` : "")}${link("pacientes", "Pacientes")}${link("agenda", "Agenda")}${link("mensajes", "Mensajes")}${link("config", "Configuración")}</nav>
+    <nav class="nav" aria-label="Principal">${link("hoy", "Hoy", n ? `<span class="count">${n}</span>` : "")}${link("calendario", "Calendario")}${link("pacientes", "Pacientes")}${link("mensajes", "Mensajes")}${link("config", "Configuración")}</nav>
     <div class="who"><span>${esc(D.settings.clinic_name)}${DEMO ? " · demostración" : ""}</span>${DEMO ? "" : `<button class="link" data-act="logout">Salir</button>`}</div></div></header>
   <main>${view()}</main>`;
   const chat = $("#chat");
@@ -529,6 +655,8 @@ const actions = {
   "new-appt": (el) => dlgNewAppt(el.dataset.id),
   "open-appt": (el) => dlgAppt(el.dataset.id),
   week: (el) => { ui.week = +el.dataset.d === 0 ? 0 : ui.week + +el.dataset.d; render(); },
+  month: (el) => { ui.month = +el.dataset.d === 0 ? 0 : ui.month + +el.dataset.d; ui.day = null; render(); },
+  "cal-day": (el) => { ui.day = el.dataset.key; render(); document.querySelector(".cal + section")?.scrollIntoView({ behavior: "smooth", block: "start" }); },
   logout: async () => { await sb.auth.signOut(); location.reload(); },
   async force(el) {
     el.disabled = true; el.textContent = "Enviando…";
@@ -591,12 +719,20 @@ const forms = {
     await refresh();
   },
   async proc(form) {
-    const f = Object.fromEntries(new FormData(form).entries());
+    const fd = new FormData(form), f = Object.fromEntries(fd.entries());
     const int = (k) => Math.max(0, parseInt(f[k] || "0", 10));
-    const patch = { name: f.name.trim(), active: !!f.active, reminders_on: !!f.reminders_on, postcare_on: !!f.postcare_on, window_min_days: int("window_min_days"), window_max_days: int("window_max_days"), first_reminder_days: int("first_reminder_days"), repeat_days: Math.max(1, int("repeat_days")), max_reminders: int("max_reminders"), duration_min: Math.max(5, int("duration_min")), price: Number(f.price || 0), reminder_template: f.reminder_template, postcare_template: f.postcare_template, postcare_hours: f.postcare_hours.split(",").map((x) => parseInt(x, 10)).filter((x) => x > 0) };
-    if (patch.window_max_days <= patch.window_min_days) return toast("La ventana debe cerrar después del día en que abre.", true);
-    await run(() => api.update("procedures", form.dataset.id, patch), `${patch.name}: cambios guardados.`);
+    const unit = UNITS[f.win_u][0];
+    const min = int("win_min_n") * unit, max = int("win_max_n") * unit;
+    if (max <= min) return toast("El segundo número debe ser mayor que el primero (por ejemplo, entre 3 y 4 meses).", true);
+    const post = fd.getAll("postcare_h").map(Number);
+    const patch = { name: f.name.trim(), active: !!f.active, reminders_on: !!f.reminders_on, window_min_days: min, window_max_days: max,
+      first_reminder_days: Math.max(0, min - int("first_before")), repeat_days: Math.max(1, int("repeat_days")), max_reminders: Math.max(1, int("max_reminders")),
+      duration_min: Math.max(5, int("duration_min")), price: Number(f.price || 0), postcare_on: post.length > 0, postcare_hours: post,
+      reminder_template: f.reminder_template, postcare_template: f.postcare_template };
+    await run(() => api.update("procedures", form.dataset.id, patch), `${patch.name}: guardado.`);
     await refresh();
+    const card = [...document.querySelectorAll("form[data-form=proc]")].find((x) => x.dataset.id === form.dataset.id)?.closest("details");
+    if (card) card.open = true;
   },
   async staff(form) {
     const email = new FormData(form).get("email").trim().toLowerCase();
@@ -628,7 +764,10 @@ document.addEventListener("input", (e) => {
     const q = $("[data-search]"); q.focus(); q.setSelectionRange(q.value.length, q.value.length);
   }
 });
-document.addEventListener("change", (e) => { if (e.target.matches("[data-msgfilter]")) { ui.msgFilter = e.target.value; render(); } });
+document.addEventListener("change", (e) => {
+  if (e.target.matches("[data-msgfilter]")) { ui.msgFilter = e.target.value; render(); }
+  if (e.target.matches("[data-toggle]")) { ui[e.target.dataset.toggle] = e.target.checked; render(); }
+});
 document.addEventListener("focusout", () => setTimeout(() => { if (ui.pendingRefresh && !$("#dlg").open && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) { ui.pendingRefresh = false; render(); } }, 50));
 window.addEventListener("hashchange", () => { render(); window.scrollTo(0, 0); });
 

@@ -207,8 +207,8 @@ end $$;
 insert into procedures (name, window_min_days, window_max_days, first_reminder_days, repeat_days, max_reminders, duration_min, price, postcare_hours, sort)
 select * from (values
   ('Toxina botulínica', 90, 120, 90, 3, 2, 30, 0, '{24}'::int[], 1),
-  ('Ácido hialurónico', 270, 365, 270, 7, 2, 45, 0, '{24,168}'::int[], 2),
-  ('Hilos tensores', 365, 540, 365, 14, 2, 90, 0, '{24,168}'::int[], 3),
+  ('Ácido hialurónico', 270, 360, 270, 7, 2, 45, 0, '{24,168}'::int[], 2),
+  ('Hilos tensores', 360, 540, 360, 14, 2, 90, 0, '{24,168}'::int[], 3),
   ('Control GLP-1', 7, 9, 6, 2, 1, 20, 0, '{}'::int[], 4)
 ) as v
 where not exists (select 1 from procedures);
