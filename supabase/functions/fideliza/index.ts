@@ -45,7 +45,7 @@ async function twilioOnce(from: string, to: string, body: string) {
     body: form,
   });
   const j = await r.json().catch(() => ({}));
-  return r.ok ? { sid: j.sid as string } : { error: explain(j.code, j.message) };
+  return r.ok ? { sid: j.sid as string } : { error: `${explain(j.code, j.message)} [Twilio dice: ${j.message ?? r.status}]` };
 }
 
 // Prueba las combinaciones de remitente y formato de número hasta que Twilio acepte una.
