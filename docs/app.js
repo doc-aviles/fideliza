@@ -550,6 +550,15 @@ function render() {
   const chat = $("#chat");
   if (chat) chat.scrollTop = chat.scrollHeight;
 }
+// Indicadores de carga: botón ocupado y barra superior.
+let pendingLoads = 0;
+function loading(on) { pendingLoads = Math.max(0, pendingLoads + (on ? 1 : -1)); const b = $("#loadbar"); if (b) b.hidden = pendingLoads === 0; }
+async function withBusy(el, fn) {
+  if (el) { el.classList.add("busy"); el.setAttribute("aria-busy", "true"); el.disabled = true; }
+  loading(true);
+  try { return await fn(); }
+  finally { loading(false); if (el && el.isConnected) { el.classList.remove("busy"); el.removeAttribute("aria-busy"); el.disabled = false; } }
+}
 let toastTimer;
 function toast(text, err = false) {
   const t = $("#toast");
@@ -557,7 +566,7 @@ function toast(text, err = false) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (t.hidden = true), err ? 9000 : 4000);
 }
-async function refresh() { await load(); render(); }
+async function refresh() { await withBusy(null, load); render(); }
 async function softRefresh() {
   const a = document.activeElement;
   const typing = a && ["INPUT", "TEXTAREA", "SELECT"].includes(a.tagName);
@@ -577,7 +586,7 @@ function dialog(html, onSubmit) {
     e.preventDefault();
     if (e.submitter?.value === "cancel") return d.close();
     const data = Object.fromEntries(new FormData(e.target).entries());
-    const ok = await run(() => onSubmit(data, e.submitter?.value));
+    const ok = await withBusy(e.submitter, () => run(() => onSubmit(data, e.submitter?.value)));
     if (ok !== undefined) { d.close(); await refresh(); }
   });
   d.showModal();
@@ -659,7 +668,6 @@ const actions = {
   "cal-day": (el) => { ui.day = el.dataset.key; render(); document.querySelector(".cal + section")?.scrollIntoView({ behavior: "smooth", block: "start" }); },
   logout: async () => { await sb.auth.signOut(); location.reload(); },
   async force(el) {
-    el.disabled = true; el.textContent = "Enviando…";
     const r = await run(() => api.fn({ force_treatment: el.dataset.id }));
     if (r) {
       if (r.skipped) toast(r.skipped, true);
@@ -752,11 +760,15 @@ document.addEventListener("click", (e) => {
   const jump = e.target.closest("[data-jump]");
   if (jump) { e.preventDefault(); document.getElementById(jump.dataset.jump)?.scrollIntoView({ behavior: "smooth", block: "start" }); return; }
   const el = e.target.closest("[data-act]");
-  if (el && actions[el.dataset.act]) { e.preventDefault(); actions[el.dataset.act](el); }
+  if (el && actions[el.dataset.act]) {
+    e.preventDefault();
+    const quick = ["week", "month", "cal-day", "new-patient", "edit-patient", "new-treatment", "new-appt", "open-appt"].includes(el.dataset.act);
+    if (quick) actions[el.dataset.act](el); else withBusy(el.tagName === "BUTTON" ? el : null, () => actions[el.dataset.act](el));
+  }
 });
 document.addEventListener("submit", (e) => {
   const f = e.target.closest("[data-form]");
-  if (f && forms[f.dataset.form]) { e.preventDefault(); forms[f.dataset.form](f); }
+  if (f && forms[f.dataset.form]) { e.preventDefault(); withBusy(e.submitter || $("button.primary", f), () => forms[f.dataset.form](f)); }
 });
 document.addEventListener("input", (e) => {
   if (e.target.matches("[data-search]")) {
@@ -779,9 +791,7 @@ function loginScreen(note = "") {
   $("#login").addEventListener("submit", async (e) => {
     e.preventDefault();
     const email = $("#le").value.trim();
-    const btn = $("button", e.target); btn.disabled = true;
-    const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname } });
-    btn.disabled = false;
+    const { error } = await withBusy($("button", e.target), () => sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname } }));
     if (error) return toast(/rate limit|security purposes/i.test(error.message) ? "Se pidieron demasiados correos seguidos. Espera unos minutos y vuelve a intentarlo, o usa el código del último correo." : error.message, true);
     codeScreen(email);
   });
@@ -794,8 +804,10 @@ function codeScreen(email) {
   $("#code").addEventListener("submit", async (e) => {
     e.preventDefault();
     const token = $("#lc").value.replace(/\D/g, "");
-    let r = await sb.auth.verifyOtp({ email, token, type: "email" });
-    if (r.error) r = await sb.auth.verifyOtp({ email, token, type: "signup" });
+    const r = await withBusy($("button", e.target), async () => {
+      const a = await sb.auth.verifyOtp({ email, token, type: "email" });
+      return a.error ? sb.auth.verifyOtp({ email, token, type: "signup" }) : a;
+    });
     if (r.error) return toast("El código no es válido o ya venció. Revisa que sea el del correo más reciente o pide uno nuevo.", true);
     if (!user) { user = r.data.user; boot(); }
   });
@@ -819,7 +831,8 @@ async function start() {
 async function boot() {
   if (location.hash.includes("access_token")) history.replaceState(null, "", location.pathname + "#/hoy");
   try {
-    const ok = await load();
+    $("#app").innerHTML = `<div class="gate"><h1>Fideliza</h1><p class="loading"><span class="spinner"></span>Cargando la información del consultorio…</p></div>`;
+    const ok = await withBusy(null, load);
     if (!ok) {
       gate(`<div class="notice red" style="margin-top:16px"><div><strong>${esc(user.email)} no tiene acceso a este consultorio.</strong><br>Pide a quien administra Fideliza que agregue tu correo en Configuración, Equipo.</div></div><button id="out">Entrar con otro correo</button>`);
       $("#out").addEventListener("click", async () => { await sb.auth.signOut(); location.reload(); });
